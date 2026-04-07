@@ -15,6 +15,7 @@ except Exception:  # pragma: no cover
 from astrbot.api import logger
 
 from .file_preview_utils import pdf_bytes_to_markdown
+from .proxy_utils import create_async_http_client
 from .wechat_utils import is_wechat_article_url, fetch_wechat_article_markdown
 
 
@@ -95,7 +96,10 @@ def extract_first_img_src(html: str) -> Optional[str]:
 
 
 async def fetch_html(
-    url: str, timeout_sec: int, last_fetch_info: Dict[str, Any]
+    url: str,
+    timeout_sec: int,
+    last_fetch_info: Dict[str, Any],
+    proxy: Optional[str] = None,
 ) -> Optional[str]:
     """获取网页 HTML 文本并记录 Cloudflare 相关信息。"""
 
@@ -229,6 +233,44 @@ async def fetch_html(
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, _do)
 
+    async def _proxy_fetch() -> Optional[str]:
+        try:
+            async with create_async_http_client(
+                headers={
+                    "User-Agent": "AstrBot-zssm/1.0 (+https://github.com/xiaoxi68/astrbot_zssm_explain)"
+                },
+                timeout_sec=timeout_sec,
+                follow_redirects=True,
+                proxy=proxy,
+            ) as client:
+                resp = await client.get(url)
+                status = int(resp.status_code)
+                hdrs = dict(resp.headers)
+                if 200 <= status < 400:
+                    text = resp.text
+                    _mark(
+                        status=status,
+                        headers=hdrs,
+                        text_hint=text[:512],
+                        via="httpx_proxy",
+                    )
+                    return text
+                _mark(status=status, headers=hdrs, text_hint=None, via="httpx_proxy")
+                return None
+        except Exception as e:  # pragma: no cover - 网络环境相关
+            logger.warning(f"zssm_explain: proxy fetch failed: {e}")
+            _mark(
+                status=None,
+                headers=None,
+                text_hint=None,
+                via="httpx_proxy",
+                error=str(e),
+            )
+            return None
+
+    if proxy:
+        return await _proxy_fetch()
+
     html = await _aiohttp_fetch()
     if html is not None:
         return html
@@ -236,7 +278,10 @@ async def fetch_html(
 
 
 async def fetch_pdf_bytes(
-    url: str, timeout_sec: int, max_bytes: int
+    url: str,
+    timeout_sec: int,
+    max_bytes: int,
+    proxy: Optional[str] = None,
 ) -> Optional[bytes]:
     """抓取 PDF 二进制内容（做体积限制），用于 URL 场景的 PDF 摘要。"""
     if not (isinstance(url, str) and url.strip()):
@@ -276,6 +321,44 @@ async def fetch_pdf_bytes(
         except Exception as e:
             logger.warning(f"zssm_explain: aiohttp fetch pdf failed: {e}")
             return None
+
+    async def _proxy_fetch() -> Optional[bytes]:
+        try:
+            async with create_async_http_client(
+                headers=headers,
+                timeout_sec=timeout_sec,
+                follow_redirects=True,
+                proxy=proxy,
+            ) as client:
+                async with client.stream("GET", url) as resp:
+                    status = int(resp.status_code)
+                    if not (200 <= status < 400):
+                        return None
+                    cl = resp.headers.get("Content-Length")
+                    if cl and cl.isdigit() and int(cl) > max_bytes:
+                        logger.warning(
+                            "zssm_explain: pdf over size limit when fetching url=%s",
+                            url,
+                        )
+                        return None
+                    buf = bytearray()
+                    async for chunk in resp.aiter_bytes(8192):
+                        if not chunk:
+                            break
+                        buf.extend(chunk)
+                        if len(buf) > max_bytes:
+                            logger.warning(
+                                "zssm_explain: pdf over size limit when fetching url=%s",
+                                url,
+                            )
+                            return None
+                    return bytes(buf)
+        except Exception as e:
+            logger.warning(f"zssm_explain: proxy fetch pdf failed: {e}")
+            return None
+
+    if proxy:
+        return await _proxy_fetch()
 
     data = await _aiohttp_fetch()
     if data is not None:
@@ -356,6 +439,7 @@ async def prepare_url_prompt(
     cf_screenshot_height: int,
     file_preview_max_bytes: int,
     user_prompt_template: str,
+    proxy: Optional[str] = None,
 ) -> Optional[Tuple[str, Optional[str], List[str]]]:
     """统一处理网页抓取：成功返回摘要提示词；若因 Cloudflare 被拦截则回退到截图模式。
 
@@ -372,6 +456,7 @@ async def prepare_url_prompt(
             last_fetch_info,
             max_chars=max_chars,
             user_prompt_template=user_prompt_template,
+            proxy=proxy,
         )
         if wx_ctx:
             return wx_ctx
@@ -389,7 +474,7 @@ async def prepare_url_prompt(
             if isinstance(file_preview_max_bytes, int) and file_preview_max_bytes > 0
             else 2 * 1024 * 1024
         )
-        pdf_bytes = await fetch_pdf_bytes(url, timeout_sec, max_bytes)
+        pdf_bytes = await fetch_pdf_bytes(url, timeout_sec, max_bytes, proxy=proxy)
         if pdf_bytes:
             text = pdf_bytes_to_markdown(pdf_bytes)
             if text:
@@ -403,7 +488,7 @@ async def prepare_url_prompt(
                 return (user_prompt, None, [])
 
     # 3) 常规 HTML 场景
-    html = await fetch_html(url, timeout_sec, last_fetch_info)
+    html = await fetch_html(url, timeout_sec, last_fetch_info, proxy=proxy)
     if html:
         user_prompt, _title = build_url_user_prompt(
             url, html, max_chars, user_prompt_template
@@ -424,7 +509,11 @@ async def prepare_url_prompt(
                 info.get("status"),
                 info.get("via"),
             )
-            ready = await wait_cf_screenshot_ready(screenshot_url, last_fetch_info)
+            ready = await wait_cf_screenshot_ready(
+                screenshot_url,
+                last_fetch_info,
+                proxy=proxy,
+            )
             if not ready:
                 try:
                     last_fetch_info["cf_screenshot_ready"] = False
@@ -440,13 +529,17 @@ async def prepare_url_prompt(
             except Exception:
                 pass
 
-            final_image_url = await resolve_liveshot_image_url(screenshot_url)
+            final_image_url = await resolve_liveshot_image_url(
+                screenshot_url, proxy=proxy
+            )
             if not final_image_url:
                 logger.warning(
                     "zssm_explain: failed to resolve liveshot image from html response"
                 )
                 return None
-            local_image_path = await download_image_to_temp(final_image_url)
+            local_image_path = await download_image_to_temp(
+                final_image_url, proxy=proxy
+            )
             if not local_image_path:
                 logger.warning(
                     "zssm_explain: failed to download liveshot image to temp file"
@@ -478,7 +571,11 @@ def build_url_failure_message(
     return "网页获取失败或不受支持，请稍后重试并确认链接可访问。"
 
 
-async def probe_screenshot_url(url: str, per_request_timeout: int = 6) -> bool:
+async def probe_screenshot_url(
+    url: str,
+    per_request_timeout: int = 6,
+    proxy: Optional[str] = None,
+) -> bool:
     """尝试访问截图 URL，确认资源已经生成。"""
     if not url:
         return False
@@ -487,6 +584,20 @@ async def probe_screenshot_url(url: str, per_request_timeout: int = 6) -> bool:
         "Range": "bytes=0-256",
         "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
     }
+    if proxy:
+        try:
+            async with create_async_http_client(
+                headers=headers,
+                timeout_sec=per_request_timeout,
+                follow_redirects=True,
+                proxy=proxy,
+            ) as client:
+                resp = await client.get(url)
+                if 200 <= int(resp.status_code) < 400 and resp.content:
+                    return True
+        except Exception:
+            pass
+        return False
     if aiohttp is not None:
         try:
             async with aiohttp.ClientSession(headers=headers) as session:
@@ -522,6 +633,7 @@ async def wait_cf_screenshot_ready(
     last_fetch_info: Dict[str, Any],
     overall_timeout: float = 12.0,
     interval_sec: float = 1.5,
+    proxy: Optional[str] = None,
 ) -> bool:
     """轮询 urlscan 截图是否已经可访问。"""
     if not url:
@@ -531,7 +643,7 @@ async def wait_cf_screenshot_ready(
     attempt = 0
     while True:
         attempt += 1
-        if await probe_screenshot_url(url):
+        if await probe_screenshot_url(url, proxy=proxy):
             try:
                 last_fetch_info["cf_screenshot_ready_attempts"] = attempt
             except Exception:
@@ -546,7 +658,11 @@ async def wait_cf_screenshot_ready(
     return False
 
 
-async def download_image_to_temp(url: str, timeout_sec: int = 15) -> Optional[str]:
+async def download_image_to_temp(
+    url: str,
+    timeout_sec: int = 15,
+    proxy: Optional[str] = None,
+) -> Optional[str]:
     """下载图片到临时文件并返回路径。"""
     if not url:
         return None
@@ -556,6 +672,20 @@ async def download_image_to_temp(url: str, timeout_sec: int = 15) -> Optional[st
     }
 
     async def _fetch() -> Tuple[Optional[bytes], Optional[str]]:
+        if proxy:
+            try:
+                async with create_async_http_client(
+                    headers=headers,
+                    timeout_sec=timeout_sec,
+                    follow_redirects=True,
+                    proxy=proxy,
+                ) as client:
+                    resp = await client.get(url)
+                    if 200 <= int(resp.status_code) < 400:
+                        return resp.content, resp.headers.get("Content-Type")
+            except Exception:
+                return (None, None)
+            return (None, None)
         if aiohttp is not None:
             try:
                 async with aiohttp.ClientSession(headers=headers) as session:
@@ -607,7 +737,11 @@ async def download_image_to_temp(url: str, timeout_sec: int = 15) -> Optional[st
         return None
 
 
-async def resolve_liveshot_image_url(url: str, timeout_sec: int = 15) -> Optional[str]:
+async def resolve_liveshot_image_url(
+    url: str,
+    timeout_sec: int = 15,
+    proxy: Optional[str] = None,
+) -> Optional[str]:
     """确保拿到真正的图片 URL：若返回 HTML，则解析 <img src>。"""
     headers = {
         "User-Agent": "AstrBot-zssm/1.0 (+https://github.com/xiaoxi68/astrbot_zssm_explain)",
@@ -615,6 +749,20 @@ async def resolve_liveshot_image_url(url: str, timeout_sec: int = 15) -> Optiona
     }
 
     async def _fetch() -> Tuple[Optional[bytes], Optional[str]]:
+        if proxy:
+            try:
+                async with create_async_http_client(
+                    headers=headers,
+                    timeout_sec=timeout_sec,
+                    follow_redirects=True,
+                    proxy=proxy,
+                ) as client:
+                    resp = await client.get(url)
+                    if 200 <= int(resp.status_code) < 400:
+                        return resp.content, resp.headers.get("Content-Type")
+            except Exception:
+                return (None, None)
+            return (None, None)
         if aiohttp is not None:
             try:
                 async with aiohttp.ClientSession(headers=headers) as session:
@@ -659,5 +807,5 @@ async def resolve_liveshot_image_url(url: str, timeout_sec: int = 15) -> Optiona
     resolved = urljoin(url, img_src)
     if not resolved.startswith("http"):
         return None
-    ok = await probe_screenshot_url(resolved)
+    ok = await probe_screenshot_url(resolved, proxy=proxy)
     return resolved if ok else None

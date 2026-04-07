@@ -111,6 +111,12 @@
     "default": 6000,
     "hint": "限制输入规模，避免过长上下文"
   },
+  "request_proxy": {
+    "description": "网页摘要请求代理地址",
+    "type": "string",
+    "default": "",
+    "hint": "仅对通用 URL 网页摘要相关请求生效。支持sock5和http。"
+  },
   "llm_timeout_sec": {
     "description": "LLM 调用超时（秒）",
     "type": "int",

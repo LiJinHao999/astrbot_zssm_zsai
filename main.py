@@ -35,6 +35,7 @@ from .message_utils import (
     extract_text_images_videos_from_chain,
     ob_data,
 )
+from .proxy_utils import normalize_proxy_url
 from .prompt_utils import (
     DEFAULT_FRAME_CAPTION_PROMPT,
     DEFAULT_URL_USER_PROMPT,
@@ -78,6 +79,7 @@ from .zhihu_utils import ZhihuParseError, match_zhihu_url, prepare_zhihu_prompt
 URL_DETECT_ENABLE_KEY = "enable_url_detect"
 URL_FETCH_TIMEOUT_KEY = "url_timeout_sec"
 URL_MAX_CHARS_KEY = "url_max_chars"
+REQUEST_PROXY_KEY = "request_proxy"
 KEYWORD_ZSSM_ENABLE_KEY = "enable_keyword_zssm"
 HE_YI_WEI_ENABLE_KEY = "enable_heyiwei"
 EMPTY_ZSSM_PROMPT_ENABLE_KEY = "enable_empty_zssm_prompt"
@@ -134,6 +136,7 @@ class ZssmExplain(Star):
         super().__init__(context)
         self.config: Dict[str, Any] = config or {}
         self._last_fetch_info: Dict[str, Any] = {}
+        self._last_invalid_request_proxy: str = ""
         self._llm = LLMClient(
             context=self.context,
             get_conf_int=self._get_conf_int,
@@ -200,6 +203,23 @@ class ZssmExplain(Star):
         except Exception:
             pass
         return default
+
+    def _get_request_proxy(self) -> Optional[str]:
+        raw_proxy = self._get_conf_str(REQUEST_PROXY_KEY, "")
+        if not raw_proxy:
+            self._last_invalid_request_proxy = ""
+            return None
+        proxy = normalize_proxy_url(raw_proxy)
+        if proxy:
+            self._last_invalid_request_proxy = ""
+            return proxy
+        if self._last_invalid_request_proxy != raw_proxy:
+            logger.warning(
+                "zssm_explain: invalid request_proxy ignored: %s",
+                raw_proxy,
+            )
+            self._last_invalid_request_proxy = raw_proxy
+        return None
 
     def _get_bilibili_cookie(self) -> Optional[str]:
         """从配置中获取 B 站 Cookie 字符串。
@@ -496,7 +516,6 @@ class ZssmExplain(Star):
 
         # 获取 B 站 Cookie
         bili_cookie = self._get_bilibili_cookie()
-
         # 解析 B 站内容
         try:
             content = await resolve_bilibili_content(bili_url, cookie=bili_cookie)
@@ -696,7 +715,10 @@ class ZssmExplain(Star):
         # 优先特判 B 站视频链接：通过 video_utils 解析并下载到临时文件
         if isinstance(src, str) and is_http_url(src) and is_bilibili_url(src):
             try:
-                bili_local = await download_bilibili_video_to_temp(src, max_mb)
+                bili_local = await download_bilibili_video_to_temp(
+                    src,
+                    max_mb,
+                )
             except ValueError as ve:
                 # 大小超限，给出明确提示
                 yield self._reply_text_result(event, str(ve))
@@ -782,7 +804,10 @@ class ZssmExplain(Star):
                 if isinstance(resolved, str) and resolved:
                     src = resolved
             if isinstance(src, str) and is_http_url(src):
-                local_path = await download_video_to_temp(src, max_mb)
+                local_path = await download_video_to_temp(
+                    src,
+                    max_mb,
+                )
                 if not local_path:
                     yield self._reply_text_result(
                         event, f"视频下载失败或超过大小限制（>{max_mb}MB）。"
@@ -1719,6 +1744,7 @@ class ZssmExplain(Star):
     ) -> Optional[_ExplainPlan]:
         """将输入解析/拼装为一个可执行的解释计划（builder 阶段）。"""
         cleanup_paths: List[str] = []
+        request_proxy = self._get_request_proxy()
 
         if inline:
             urls = extract_urls_from_text(inline) if enable_url else []
@@ -1783,6 +1809,7 @@ class ZssmExplain(Star):
                     cf_screenshot_height=height,
                     file_preview_max_bytes=self._get_file_preview_max_bytes(),
                     user_prompt_template=DEFAULT_URL_USER_PROMPT,
+                    proxy=request_proxy,
                 )
                 if not url_ctx:
                     return self._ReplyPlan(
@@ -1998,6 +2025,7 @@ class ZssmExplain(Star):
                 cf_screenshot_height=height,
                 file_preview_max_bytes=self._get_file_preview_max_bytes(),
                 user_prompt_template=DEFAULT_URL_USER_PROMPT,
+                proxy=request_proxy,
             )
             if not url_ctx:
                 return self._ReplyPlan(
@@ -2018,7 +2046,12 @@ class ZssmExplain(Star):
             )
             extra_block = ""
             try:
-                html = await fetch_html(target_url, timeout_sec, self._last_fetch_info)
+                html = await fetch_html(
+                    target_url,
+                    timeout_sec,
+                    self._last_fetch_info,
+                    proxy=request_proxy,
+                )
             except Exception:
                 html = None
             if isinstance(html, str) and html.strip():

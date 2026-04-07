@@ -12,6 +12,8 @@ try:
 except Exception:  # pragma: no cover
     aiohttp = None
 
+from .proxy_utils import create_async_http_client
+
 WECHAT_MOBILE_UA = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
     "AppleWebKit/605.1.15 (KHTML, like Gecko) "
@@ -175,7 +177,9 @@ def _parse_markdown(article_url: str, page_html: str) -> Dict[str, str]:
     )
     author = _extract_text_by_patterns(
         page_html,
-        [r'<span[^>]*class=["\'][^"\']*rich_media_meta_text[^"\']*["\'][^>]*>(.*?)</span>'],
+        [
+            r'<span[^>]*class=["\'][^"\']*rich_media_meta_text[^"\']*["\'][^>]*>(.*?)</span>'
+        ],
     )
     nickname = _extract_js_var(page_html, "nickname")
     if not account and nickname:
@@ -230,6 +234,7 @@ async def fetch_wechat_article_markdown(
     *,
     max_chars: int,
     user_prompt_template: str,
+    proxy: str | None = None,
 ) -> Optional[Tuple[str, Optional[str], List[str]]]:
     """Fetch one WeChat article and build markdown snippet for prompt usage."""
     article_url = ensure_mobile_article_url(url)
@@ -289,6 +294,40 @@ async def fetch_wechat_article_markdown(
             _mark(via="wechat_aiohttp", error=str(e))
             return None
 
+    async def _proxy_fetch() -> Optional[Tuple[str, str]]:
+        try:
+            async with create_async_http_client(
+                headers=_wechat_headers(),
+                timeout_sec=timeout_sec,
+                follow_redirects=True,
+                proxy=proxy,
+            ) as client:
+                resp = await client.get(article_url)
+                status = int(resp.status_code)
+                final_url = str(resp.url)
+                if "wappoc_appmsgcaptcha" in final_url:
+                    _mark(
+                        status=status,
+                        via="wechat_httpx_proxy",
+                        final_url=final_url,
+                        error="wechat_captcha",
+                        captcha=True,
+                    )
+                    return None
+                if not (200 <= status < 400):
+                    _mark(
+                        status=status,
+                        via="wechat_httpx_proxy",
+                        final_url=final_url,
+                        error=f"status={status}",
+                    )
+                    return None
+                _mark(status=status, via="wechat_httpx_proxy", final_url=final_url)
+                return resp.text, final_url
+        except Exception as e:
+            _mark(via="wechat_httpx_proxy", error=str(e))
+            return None
+
     async def _urllib_fetch() -> Optional[Tuple[str, str]]:
         import urllib.request
 
@@ -327,9 +366,12 @@ async def fetch_wechat_article_markdown(
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, _do)
 
-    page = await _aiohttp_fetch()
-    if page is None:
-        page = await _urllib_fetch()
+    if proxy:
+        page = await _proxy_fetch()
+    else:
+        page = await _aiohttp_fetch()
+        if page is None:
+            page = await _urllib_fetch()
     if page is None:
         return None
 

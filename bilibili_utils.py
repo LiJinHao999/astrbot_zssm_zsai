@@ -13,6 +13,7 @@ except Exception:  # pragma: no cover
 
 from astrbot.api import logger
 
+from .proxy_utils import create_async_http_client
 from .video_utils import is_http_url, download_video_to_temp
 
 
@@ -155,13 +156,25 @@ def _bili_av2bv(av: str) -> Optional[str]:
     return "".join(r).replace(" ", "0")
 
 
-async def _bili_resolve_b23(url: str) -> Optional[str]:
+async def _bili_resolve_b23(url: str, proxy: Optional[str] = None) -> Optional[str]:
     """解析 b23.tv / bili2233.cn 等短链，获取真实跳转后的 URL。"""
     if not isinstance(url, str) or not url:
         return None
     full = url.strip()
     if not full.lower().startswith(("http://", "https://")):
         full = "https://" + full.lstrip("/")
+    if proxy:
+        try:
+            async with create_async_http_client(
+                headers={"User-Agent": _BILI_UA},
+                timeout_sec=15,
+                follow_redirects=True,
+                proxy=proxy,
+            ) as client:
+                resp = await client.get(full)
+                return str(resp.url)
+        except Exception:
+            return None
     if aiohttp is not None:
         try:
             async with aiohttp.ClientSession(
@@ -212,7 +225,9 @@ def _bili_extract_bvid_from_url(url: str) -> Tuple[Optional[str], int]:
 
 
 async def _bili_request_json(
-    url: str, cookie: Optional[str] = None
+    url: str,
+    cookie: Optional[str] = None,
+    proxy: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """以 JSON 形式请求 B 站 API，带简单 UA/Referer。
 
@@ -232,6 +247,20 @@ async def _bili_request_json(
         headers["Cookie"] = cookie
     # 带 Cookie 时禁用重定向，防止 Cookie 泄露
     allow_redir = not bool(cookie)
+    if proxy:
+        try:
+            async with create_async_http_client(
+                headers=headers,
+                timeout_sec=20,
+                follow_redirects=allow_redir,
+                proxy=proxy,
+            ) as client:
+                resp = await client.get(url)
+                if 200 <= int(resp.status_code) < 400:
+                    data = resp.json()
+                    return data if isinstance(data, dict) else None
+        except Exception:
+            return None
     if aiohttp is not None:
         try:
             timeout = aiohttp.ClientTimeout(total=20)
@@ -266,7 +295,11 @@ async def _bili_request_json(
         return None
 
 
-async def resolve_bilibili_video_url(url: str, quality: int = 80) -> Optional[str]:
+async def resolve_bilibili_video_url(
+    url: str,
+    quality: int = 80,
+    proxy: Optional[str] = None,
+) -> Optional[str]:
     """将 B 站页面/短链解析为可下载的视频直链 URL。
 
     支持：
@@ -285,7 +318,7 @@ async def resolve_bilibili_video_url(url: str, quality: int = 80) -> Optional[st
     try:
         parsed = urlparse(candidate)
         if "bilibilix.com" in (parsed.netloc or "").lower():
-            direct = await _bili_fetch_bilibilix(candidate)
+            direct = await _bili_fetch_bilibilix(candidate, proxy=proxy)
             if direct:
                 return direct
             # bilibilix 失败，尝试转换为 bilibili.com 走常规解析
@@ -295,7 +328,7 @@ async def resolve_bilibili_video_url(url: str, quality: int = 80) -> Optional[st
 
     # 短链先展开
     if _BILI_B23_RE.search(candidate or ""):
-        real = await _bili_resolve_b23(candidate)
+        real = await _bili_resolve_b23(candidate, proxy=proxy)
         if isinstance(real, str) and real:
             candidate = real
 
@@ -307,14 +340,14 @@ async def resolve_bilibili_video_url(url: str, quality: int = 80) -> Optional[st
     bilibilix_url = f"https://www.bilibilix.com/video/{bvid}"
     if page_index > 0:
         bilibilix_url += f"?p={page_index + 1}"
-    direct = await _bili_fetch_bilibilix(bilibilix_url)
+    direct = await _bili_fetch_bilibilix(bilibilix_url, proxy=proxy)
     if direct:
         logger.info("zssm_explain: bilibilix resolved => %s", direct[:120])
         return direct
 
     # bilibilix 失败，回退到官方 API
     view_api = f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}"
-    view_data = await _bili_request_json(view_api)
+    view_data = await _bili_request_json(view_api, proxy=proxy)
     if not (
         isinstance(view_data, dict)
         and view_data.get("code") == 0
@@ -337,7 +370,7 @@ async def resolve_bilibili_video_url(url: str, quality: int = 80) -> Optional[st
         f"https://api.bilibili.com/x/player/playurl?"
         f"avid={aid}&cid={cid}&qn={quality}&type=mp4&platform=html5"
     )
-    play_data = await _bili_request_json(play_api)
+    play_data = await _bili_request_json(play_api, proxy=proxy)
     if not (isinstance(play_data, dict) and play_data.get("code") == 0):
         return None
     pdata = play_data.get("data") or {}
@@ -381,8 +414,29 @@ def _is_valid_bili_cdn_host(url: str) -> bool:
     return False
 
 
-async def _bili_fetch_bilibilix(url: str) -> Optional[str]:
+async def _bili_fetch_bilibilix(
+    url: str,
+    proxy: Optional[str] = None,
+) -> Optional[str]:
     """通过 bilibilix.com 获取视频直链（跟随重定向）。"""
+    if proxy:
+        try:
+            async with create_async_http_client(
+                headers={"User-Agent": _BILI_UA},
+                timeout_sec=15,
+                follow_redirects=True,
+                proxy=proxy,
+            ) as client:
+                resp = await client.get(url)
+                final_url = str(resp.url)
+                if _is_valid_bili_cdn_host(final_url):
+                    return final_url
+                loc = resp.headers.get("Location")
+                if isinstance(loc, str) and _is_valid_bili_cdn_host(loc):
+                    return loc
+        except Exception as e:
+            logger.debug("zssm_explain: bilibilix proxy fetch failed: %s", e)
+        return None
     if aiohttp is not None:
         try:
             timeout = aiohttp.ClientTimeout(total=15)
@@ -405,7 +459,10 @@ async def _bili_fetch_bilibilix(url: str) -> Optional[str]:
 
 
 async def download_bilibili_video_to_temp(
-    url: str, size_mb_limit: int, quality: int = 80
+    url: str,
+    size_mb_limit: int,
+    quality: int = 80,
+    proxy: Optional[str] = None,
 ) -> Optional[str]:
     """解析 B 站视频链接并下载到临时文件。
 
@@ -414,7 +471,7 @@ async def download_bilibili_video_to_temp(
     - 超过 size_mb_limit 时抛出 ValueError；
     - 解析/下载失败时返回 None。
     """
-    stream_url = await resolve_bilibili_video_url(url, quality=quality)
+    stream_url = await resolve_bilibili_video_url(url, quality=quality, proxy=proxy)
     if not isinstance(stream_url, str) or not stream_url:
         return None
     headers = {
@@ -424,14 +481,32 @@ async def download_bilibili_video_to_temp(
     logger.info("zssm_explain: downloading bilibili stream url=%s", stream_url[:120])
     # B 站视频下载超时设为 180 秒（视频文件较大）
     result = await download_video_to_temp(
-        stream_url, size_mb_limit, headers=headers, timeout_sec=180
+        stream_url,
+        size_mb_limit,
+        headers=headers,
+        timeout_sec=180,
+        proxy=proxy,
     )
     # download_video_to_temp 返回 None 可能是大小超限或下载失败
     # 通过检查 Content-Length 区分
     if result is None:
         # 尝试 HEAD 请求检查大小
         try:
-            if aiohttp is not None:
+            if proxy:
+                async with create_async_http_client(
+                    timeout_sec=10,
+                    follow_redirects=True,
+                    proxy=proxy,
+                ) as client:
+                    resp = await client.head(stream_url, headers=headers)
+                    cl = resp.headers.get("Content-Length")
+                    if cl and cl.isdigit():
+                        size_mb = int(cl) / (1024 * 1024)
+                        if size_mb > size_mb_limit:
+                            raise ValueError(
+                                f"视频大小 {size_mb:.1f}MB 超过限制 {size_mb_limit}MB"
+                            )
+            elif aiohttp is not None:
                 async with aiohttp.ClientSession() as sess:
                     async with sess.head(
                         stream_url, headers=headers, timeout=10
@@ -520,7 +595,9 @@ def _parse_dynamic_detail_response(
 
 
 async def resolve_bilibili_dynamic(
-    url: str, cookie: Optional[str] = None
+    url: str,
+    cookie: Optional[str] = None,
+    proxy: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """解析 B 站动态，返回结构化信息。
 
@@ -540,7 +617,7 @@ async def resolve_bilibili_dynamic(
     if not m:
         # 可能是短链，先展开
         if _BILI_B23_RE.search(url or ""):
-            real = await _bili_resolve_b23(url)
+            real = await _bili_resolve_b23(url, proxy=proxy)
             if real:
                 m = _BILI_DYNAMIC_RE.search(real)
         if not m:
@@ -548,7 +625,7 @@ async def resolve_bilibili_dynamic(
 
     dynamic_id = m.group(1)
     api = f"https://api.bilibili.com/x/polymer/web-dynamic/v1/detail?id={dynamic_id}"
-    data = await _bili_request_json(api, cookie=cookie)
+    data = await _bili_request_json(api, cookie=cookie, proxy=proxy)
     return _parse_dynamic_detail_response(data)
 
 
@@ -557,7 +634,10 @@ async def resolve_bilibili_dynamic(
 # ---------------------------------------------------------------------------
 
 
-async def resolve_bilibili_live(url: str) -> Optional[Dict[str, Any]]:
+async def resolve_bilibili_live(
+    url: str,
+    proxy: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """解析 B 站直播间信息。
 
     返回字典包含：
@@ -571,7 +651,7 @@ async def resolve_bilibili_live(url: str) -> Optional[Dict[str, Any]]:
     m = _BILI_LIVE_RE.search(url or "")
     if not m:
         if _BILI_B23_RE.search(url or ""):
-            real = await _bili_resolve_b23(url)
+            real = await _bili_resolve_b23(url, proxy=proxy)
             if real:
                 m = _BILI_LIVE_RE.search(real)
         if not m:
@@ -579,7 +659,7 @@ async def resolve_bilibili_live(url: str) -> Optional[Dict[str, Any]]:
 
     room_id = m.group(1)
     api = f"https://api.live.bilibili.com/room/v1/Room/get_info?room_id={room_id}"
-    data = await _bili_request_json(api)
+    data = await _bili_request_json(api, proxy=proxy)
     if not (isinstance(data, dict) and data.get("code") == 0):
         return None
 
@@ -591,7 +671,7 @@ async def resolve_bilibili_live(url: str) -> Optional[Dict[str, Any]]:
     avatar = ""
     if uid:
         user_api = f"https://api.live.bilibili.com/live_user/v1/Master/info?uid={uid}"
-        user_data = await _bili_request_json(user_api)
+        user_data = await _bili_request_json(user_api, proxy=proxy)
         if isinstance(user_data, dict) and user_data.get("code") == 0:
             user_info = (user_data.get("data") or {}).get("info") or {}
             author = user_info.get("uname", "")
@@ -627,7 +707,10 @@ async def resolve_bilibili_live(url: str) -> Optional[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-async def resolve_bilibili_read(url: str) -> Optional[Dict[str, Any]]:
+async def resolve_bilibili_read(
+    url: str,
+    proxy: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """解析 B 站专栏文章。
 
     返回字典包含：
@@ -641,7 +724,7 @@ async def resolve_bilibili_read(url: str) -> Optional[Dict[str, Any]]:
     m = _BILI_READ_RE.search(url or "")
     if not m:
         if _BILI_B23_RE.search(url or ""):
-            real = await _bili_resolve_b23(url)
+            real = await _bili_resolve_b23(url, proxy=proxy)
             if real:
                 m = _BILI_READ_RE.search(real)
         if not m:
@@ -649,7 +732,7 @@ async def resolve_bilibili_read(url: str) -> Optional[Dict[str, Any]]:
 
     cv_id = m.group(1)
     api = f"https://api.bilibili.com/x/article/viewinfo?id={cv_id}"
-    data = await _bili_request_json(api)
+    data = await _bili_request_json(api, proxy=proxy)
     if not (isinstance(data, dict) and data.get("code") == 0):
         return None
 
@@ -669,7 +752,9 @@ async def resolve_bilibili_read(url: str) -> Optional[Dict[str, Any]]:
 
 
 async def resolve_bilibili_opus(
-    url: str, cookie: Optional[str] = None
+    url: str,
+    cookie: Optional[str] = None,
+    proxy: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """解析 B 站图文动态 (opus)。
 
@@ -688,7 +773,7 @@ async def resolve_bilibili_opus(
     m = _BILI_OPUS_RE.search(url or "")
     if not m:
         if _BILI_B23_RE.search(url or ""):
-            real = await _bili_resolve_b23(url)
+            real = await _bili_resolve_b23(url, proxy=proxy)
             if real:
                 m = _BILI_OPUS_RE.search(real)
         if not m:
@@ -697,7 +782,7 @@ async def resolve_bilibili_opus(
     opus_id = m.group(1)
     # opus 使用动态 API，直接用 opus_id 作为 dynamic_id 查询
     api = f"https://api.bilibili.com/x/polymer/web-dynamic/v1/detail?id={opus_id}"
-    data = await _bili_request_json(api, cookie=cookie)
+    data = await _bili_request_json(api, cookie=cookie, proxy=proxy)
     result = _parse_dynamic_detail_response(data)
     if not result:
         logger.debug(
@@ -711,7 +796,10 @@ async def resolve_bilibili_opus(
 # ---------------------------------------------------------------------------
 
 
-async def resolve_bilibili_video_info(url: str) -> Optional[Dict[str, Any]]:
+async def resolve_bilibili_video_info(
+    url: str,
+    proxy: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """获取 B 站视频元信息（不下载视频）。
 
     返回字典包含：
@@ -727,7 +815,7 @@ async def resolve_bilibili_video_info(url: str) -> Optional[Dict[str, Any]]:
     """
     candidate = url
     if _BILI_B23_RE.search(url or ""):
-        real = await _bili_resolve_b23(url)
+        real = await _bili_resolve_b23(url, proxy=proxy)
         if real:
             candidate = real
 
@@ -736,7 +824,7 @@ async def resolve_bilibili_video_info(url: str) -> Optional[Dict[str, Any]]:
         return None
 
     api = f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}"
-    data = await _bili_request_json(api)
+    data = await _bili_request_json(api, proxy=proxy)
     if not (isinstance(data, dict) and data.get("code") == 0):
         return None
 
@@ -784,7 +872,9 @@ async def resolve_bilibili_video_info(url: str) -> Optional[Dict[str, Any]]:
 
 
 async def resolve_bilibili_content(
-    url: str, cookie: Optional[str] = None
+    url: str,
+    cookie: Optional[str] = None,
+    proxy: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """统一解析 B 站链接，自动识别类型并返回结构化内容。
 
@@ -808,7 +898,7 @@ async def resolve_bilibili_content(
 
     # 短链先展开
     if url_type == "short":
-        real = await _bili_resolve_b23(url)
+        real = await _bili_resolve_b23(url, proxy=proxy)
         if not real:
             return None
         url = real
@@ -819,15 +909,15 @@ async def resolve_bilibili_content(
     result: Optional[Dict[str, Any]] = None
 
     if url_type == "video":
-        result = await resolve_bilibili_video_info(url)
+        result = await resolve_bilibili_video_info(url, proxy=proxy)
     elif url_type == "dynamic":
-        result = await resolve_bilibili_dynamic(url, cookie=cookie)
+        result = await resolve_bilibili_dynamic(url, cookie=cookie, proxy=proxy)
     elif url_type == "live":
-        result = await resolve_bilibili_live(url)
+        result = await resolve_bilibili_live(url, proxy=proxy)
     elif url_type == "read":
-        result = await resolve_bilibili_read(url)
+        result = await resolve_bilibili_read(url, proxy=proxy)
     elif url_type == "opus":
-        result = await resolve_bilibili_opus(url, cookie=cookie)
+        result = await resolve_bilibili_opus(url, cookie=cookie, proxy=proxy)
 
     if result:
         result["type"] = url_type
@@ -850,7 +940,10 @@ __all__ = [
 ]
 
 
-async def resolve_bilibili_short_url(url: str) -> Optional[str]:
+async def resolve_bilibili_short_url(
+    url: str,
+    proxy: Optional[str] = None,
+) -> Optional[str]:
     """展开 B 站短链（b23.tv / bili2233.cn）。
 
     如果不是短链或展开失败，返回原 URL。
@@ -859,5 +952,5 @@ async def resolve_bilibili_short_url(url: str) -> Optional[str]:
         return url
     if get_bilibili_url_type(url) != "short":
         return url
-    real = await _bili_resolve_b23(url)
+    real = await _bili_resolve_b23(url, proxy=proxy)
     return real if real else url

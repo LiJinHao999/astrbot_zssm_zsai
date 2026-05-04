@@ -1,71 +1,73 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import List, Tuple, Optional, Any, Dict, Set, Union
-import os
 import asyncio
+import math
+import os
 import re
 import shutil
-import math
 import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
-from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star
-from astrbot.api import logger
 import astrbot.api.message_components as Comp
-from astrbot.core.star.star_handler import EventType
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.star import Context, Star
 from astrbot.core.pipeline.context_utils import call_event_hook
+from astrbot.core.star.star_handler import EventType
 
-from .url_utils import (
-    fetch_html,
-    extract_urls_from_text,
-    prepare_url_prompt,
-    build_url_failure_message,
-    build_url_brief_for_forward,
-)
-from .message_utils import (
-    extract_quoted_payload_with_videos,
-    extract_text_images_videos_from_chain,
-    call_get_msg,
-    ob_data,
-    extract_from_onebot_message_payload_with_videos,
-)
-from .video_utils import (
-    extract_videos_from_chain,
-    is_http_url,
-    is_abs_file,
-    napcat_resolve_file_url,
-    extract_forward_video_keyframes,
-    probe_duration_sec,
-    resolve_ffmpeg,
-    resolve_ffprobe,
-    download_video_to_temp,
-    sample_frames_equidistant,
-    sample_frames_with_ffmpeg,
-    extract_audio_wav,
-    get_video_size_mb,
-    is_safe_video_path,
-    compress_video_to_target,
-)
 from .bilibili_utils import (
-    is_bilibili_url,
     download_bilibili_video_to_temp,
     get_bilibili_url_type,
+    is_bilibili_url,
     resolve_bilibili_content,
     resolve_bilibili_short_url,
 )
-from .prompt_utils import (
-    DEFAULT_URL_USER_PROMPT,
-    DEFAULT_VIDEO_USER_PROMPT,
-    DEFAULT_FRAME_CAPTION_PROMPT,
-    build_user_prompt,
-    build_system_prompt_for_event,
-)
-from .llm_client import LLMClient
 from .file_preview_utils import (
     build_text_exts_from_config,
     extract_file_preview_from_reply,
 )
+from .llm_client import LLMClient
+from .message_utils import (
+    call_get_msg,
+    extract_from_onebot_message_payload_with_videos,
+    extract_quoted_payload_with_videos,
+    extract_text_images_videos_from_chain,
+    ob_data,
+)
+from .proxy_utils import normalize_proxy_url
+from .prompt_utils import (
+    DEFAULT_FRAME_CAPTION_PROMPT,
+    DEFAULT_URL_USER_PROMPT,
+    DEFAULT_VIDEO_USER_PROMPT,
+    build_system_prompt_for_event,
+    build_user_prompt,
+)
+from .url_utils import (
+    build_url_brief_for_forward,
+    build_url_failure_message,
+    extract_urls_from_text,
+    fetch_html,
+    prepare_url_prompt,
+)
+from .video_utils import (
+    compress_video_to_target,
+    download_video_to_temp,
+    extract_audio_wav,
+    extract_forward_video_keyframes,
+    extract_videos_from_chain,
+    get_video_size_mb,
+    is_abs_file,
+    is_http_url,
+    is_safe_video_path,
+    napcat_resolve_file_url,
+    probe_duration_sec,
+    resolve_ffmpeg,
+    resolve_ffprobe,
+    sample_frames_equidistant,
+    sample_frames_with_ffmpeg,
+)
+from .zhihu_utils import ZhihuParseError, match_zhihu_url, prepare_zhihu_prompt
 
 """
 默认提示词已集中放在 prompt_utils.py 中：
@@ -77,6 +79,7 @@ from .file_preview_utils import (
 URL_DETECT_ENABLE_KEY = "enable_url_detect"
 URL_FETCH_TIMEOUT_KEY = "url_timeout_sec"
 URL_MAX_CHARS_KEY = "url_max_chars"
+REQUEST_PROXY_KEY = "request_proxy"
 KEYWORD_ZSSM_ENABLE_KEY = "enable_keyword_zssm"
 HE_YI_WEI_ENABLE_KEY = "enable_heyiwei"
 EMPTY_ZSSM_PROMPT_ENABLE_KEY = "enable_empty_zssm_prompt"
@@ -102,6 +105,7 @@ VIDEO_DIRECT_FPS_KEY = "video_direct_fps"
 VIDEO_DIRECT_TARGET_SIZE_MB_KEY = "video_direct_target_size_mb"
 VIDEO_DIRECT_TIMEOUT_SEC_KEY = "video_direct_timeout_sec"
 BILIBILI_COOKIE_KEY = "bilibili_cookie"
+ZHIHU_COOKIE_KEY = "zhihu_cookie"
 
 DEFAULT_URL_DETECT_ENABLE = True
 DEFAULT_URL_FETCH_TIMEOUT = 20
@@ -119,6 +123,12 @@ DEFAULT_FILE_PREVIEW_EXTS = "txt,md,log,json,csv,ini,cfg,yml,yaml,py"
 DEFAULT_FILE_PREVIEW_MAX_SIZE_KB = 100
 DEFAULT_FORWARD_VIDEO_KEYFRAME_ENABLE = True
 DEFAULT_FORWARD_VIDEO_MAX_COUNT = 2
+TRIGGER_KEYWORDS_KEY = "trigger_keywords"
+COMMAND_TRIGGER_KEYWORD = "zssm"
+DEFAULT_EXTRA_TRIGGER_KEYWORDS = ("hyw", "何意味")
+HE_YI_WEI_TRIGGER_KEYWORDS = frozenset(
+    kw.lower() for kw in DEFAULT_EXTRA_TRIGGER_KEYWORDS
+)
 
 
 class ZssmExplain(Star):
@@ -126,6 +136,7 @@ class ZssmExplain(Star):
         super().__init__(context)
         self.config: Dict[str, Any] = config or {}
         self._last_fetch_info: Dict[str, Any] = {}
+        self._last_invalid_request_proxy: str = ""
         self._llm = LLMClient(
             context=self.context,
             get_conf_int=self._get_conf_int,
@@ -135,6 +146,7 @@ class ZssmExplain(Star):
 
     async def initialize(self):
         """可选：插件初始化。"""
+        self._migrate_legacy_trigger_keywords_config()
 
     def _reply_text_result(self, event: AstrMessageEvent, text: str):
         """构造一个显式“回复调用者”的文本消息结果。
@@ -192,6 +204,23 @@ class ZssmExplain(Star):
             pass
         return default
 
+    def _get_request_proxy(self) -> Optional[str]:
+        raw_proxy = self._get_conf_str(REQUEST_PROXY_KEY, "")
+        if not raw_proxy:
+            self._last_invalid_request_proxy = ""
+            return None
+        proxy = normalize_proxy_url(raw_proxy)
+        if proxy:
+            self._last_invalid_request_proxy = ""
+            return proxy
+        if self._last_invalid_request_proxy != raw_proxy:
+            logger.warning(
+                "zssm_explain: invalid request_proxy ignored: %s",
+                raw_proxy,
+            )
+            self._last_invalid_request_proxy = raw_proxy
+        return None
+
     def _get_bilibili_cookie(self) -> Optional[str]:
         """从配置中获取 B 站 Cookie 字符串。
 
@@ -231,6 +260,73 @@ class ZssmExplain(Star):
         except Exception:
             pass
         return []
+
+    @staticmethod
+    def _normalize_trigger_keyword(keyword: object) -> str:
+        if not isinstance(keyword, (str, int)):
+            return ""
+        return str(keyword).strip().lower()
+
+    def _get_configured_trigger_keywords(self) -> List[str]:
+        # 仅当配置项缺失时回退默认；显式配置空列表表示禁用额外关键词。
+        if isinstance(self.config, dict) and TRIGGER_KEYWORDS_KEY in self.config:
+            raw_keywords = self._get_conf_list_str(TRIGGER_KEYWORDS_KEY)
+        else:
+            raw_keywords = list(DEFAULT_EXTRA_TRIGGER_KEYWORDS)
+
+        keywords: List[str] = []
+        seen: Set[str] = set()
+        for raw_keyword in raw_keywords:
+            keyword = self._normalize_trigger_keyword(raw_keyword)
+            if not keyword or keyword == COMMAND_TRIGGER_KEYWORD or keyword in seen:
+                continue
+            keywords.append(keyword)
+            seen.add(keyword)
+        return keywords
+
+    def _get_effective_trigger_keywords(self) -> List[str]:
+        return [COMMAND_TRIGGER_KEYWORD, *self._get_configured_trigger_keywords()]
+
+    @staticmethod
+    def _build_trigger_keyword_pattern(keywords: List[str]) -> str:
+        escaped = sorted(
+            (re.escape(keyword) for keyword in keywords), key=len, reverse=True
+        )
+        return "|".join(escaped)
+
+    def _get_trigger_keyword_pattern(self) -> str:
+        return self._build_trigger_keyword_pattern(
+            self._get_effective_trigger_keywords()
+        )
+
+    def _migrate_legacy_trigger_keywords_config(self) -> None:
+        if not isinstance(self.config, dict):
+            return
+        if self._get_conf_bool(HE_YI_WEI_ENABLE_KEY, True):
+            return
+
+        configured_keywords = self._get_configured_trigger_keywords()
+        default_keywords = [
+            self._normalize_trigger_keyword(keyword)
+            for keyword in DEFAULT_EXTRA_TRIGGER_KEYWORDS
+        ]
+        if configured_keywords != default_keywords:
+            return
+
+        self.config[TRIGGER_KEYWORDS_KEY] = []
+        self.config[HE_YI_WEI_ENABLE_KEY] = True
+        save_config = getattr(self.config, "save_config", None)
+        if callable(save_config):
+            try:
+                save_config()
+            except Exception as exc:
+                logger.warning(
+                    "zssm_explain: failed to persist legacy trigger keyword migration: %s",
+                    exc,
+                )
+        logger.info(
+            "zssm_explain: migrated legacy enable_heyiwei=false to trigger_keywords=[]"
+        )
 
     def _is_group_allowed(self, event: AstrMessageEvent) -> bool:
         """根据配置的白/黑名单判断是否允许在该群聊中使用插件。
@@ -420,7 +516,6 @@ class ZssmExplain(Star):
 
         # 获取 B 站 Cookie
         bili_cookie = self._get_bilibili_cookie()
-
         # 解析 B 站内容
         try:
             content = await resolve_bilibili_content(bili_url, cookie=bili_cookie)
@@ -620,7 +715,10 @@ class ZssmExplain(Star):
         # 优先特判 B 站视频链接：通过 video_utils 解析并下载到临时文件
         if isinstance(src, str) and is_http_url(src) and is_bilibili_url(src):
             try:
-                bili_local = await download_bilibili_video_to_temp(src, max_mb)
+                bili_local = await download_bilibili_video_to_temp(
+                    src,
+                    max_mb,
+                )
             except ValueError as ve:
                 # 大小超限，给出明确提示
                 yield self._reply_text_result(event, str(ve))
@@ -706,7 +804,10 @@ class ZssmExplain(Star):
                 if isinstance(resolved, str) and resolved:
                     src = resolved
             if isinstance(src, str) and is_http_url(src):
-                local_path = await download_video_to_temp(src, max_mb)
+                local_path = await download_video_to_temp(
+                    src,
+                    max_mb,
+                )
                 if not local_path:
                     yield self._reply_text_result(
                         event, f"视频下载失败或超过大小限制（>{max_mb}MB）。"
@@ -1097,7 +1198,6 @@ class ZssmExplain(Star):
         if not isinstance(text, str):
             return False
         t = text.strip()
-        hyw_enabled = self._get_conf_bool(HE_YI_WEI_ENABLE_KEY, True)
         kw_enabled = self._get_conf_bool(KEYWORD_ZSSM_ENABLE_KEY, True)
 
         # 1. 关键词自动触发逻辑判定
@@ -1114,20 +1214,35 @@ class ZssmExplain(Star):
                 return False
 
         # 2. 正则匹配触发词
-        m = re.match(r"^[\s/!！。\.、，\-]*(zssm|hyw|何意味)(\s|$)", t, re.I)
-        if not m:
+        keyword = self._match_trigger_keyword(t)
+        if not keyword:
             logger.debug(f"zssm_explain: no trigger match: {t}")
             return False
 
-        keyword = m.group(1).lower()
         logger.debug(
             f"zssm_explain: trigger found: {keyword} (prefix={has_prefix}, is_command={is_command})"
         )
-        # 3. 如果是何意味别名，但关闭了何意味开关，拦截
-        if keyword in ("hyw", "何意味") and not hyw_enabled:
+        # 仅允许 zssm 作为带前缀的命令触发；@Bot + 额外关键词仍按关键词触发处理。
+        if has_prefix and keyword != COMMAND_TRIGGER_KEYWORD:
             return False
 
         return True
+
+    def _match_trigger_keyword(self, text: str) -> Optional[str]:
+        """从文本中提取命中的触发词，未命中则返回 None。"""
+        if not isinstance(text, str):
+            return None
+        pattern = self._get_trigger_keyword_pattern()
+        if not pattern:
+            return None
+        matched = re.match(
+            rf"^[\s/!！。\.、，\-]*({pattern})(\s|$)",
+            text.strip(),
+            re.I,
+        )
+        if not matched:
+            return None
+        return self._normalize_trigger_keyword(matched.group(1))
 
     @staticmethod
     def _first_plain_head_text(chain: list[object]) -> str:
@@ -1186,13 +1301,19 @@ class ZssmExplain(Star):
             pass
         return False
 
-    @staticmethod
-    def _strip_trigger_and_get_content(text: str) -> str:
+    def _strip_trigger_and_get_content(self, text: str) -> str:
         """剥离前缀与 zssm 触发词，返回其后的内容；无内容则返回空串。"""
         if not isinstance(text, str):
             return ""
         t = text.strip()
-        m = re.match(r"^[\s/!！。\.、，\-]*(?:zssm|hyw|何意味)(?:\s+(.+))?$", t, re.I)
+        pattern = self._get_trigger_keyword_pattern()
+        if not pattern:
+            return ""
+        m = re.match(
+            rf"^[\s/!！。\.、，\-]*(?:{pattern})(?:\s+(.+))?$",
+            t,
+            re.I,
+        )
         if not m:
             return ""
         content = (m.group(1) or "").strip()
@@ -1254,6 +1375,54 @@ class ZssmExplain(Star):
         except Exception:
             images = []
         return [x for x in images if isinstance(x, str) and x]
+
+    @staticmethod
+    def _chain_has_reply(chain: List[object]) -> bool:
+        """检测当前消息链是否显式引用了其他消息。"""
+        if not isinstance(chain, list):
+            return False
+        for seg in chain:
+            try:
+                if isinstance(seg, Comp.Reply):
+                    return True
+                if isinstance(seg, dict) and seg.get("type") in ("reply", "quote"):
+                    return True
+            except (AttributeError, TypeError):
+                continue
+        return False
+
+    def _has_direct_explainable_payload(
+        self, event: AstrMessageEvent, chain: Optional[List[object]] = None
+    ) -> bool:
+        """判断当前消息是否直接携带了可解释的媒体内容。"""
+        chain = chain if isinstance(chain, list) else self._safe_get_chain(event)
+        try:
+            if self._extract_images_from_event(event):
+                return True
+        except Exception:
+            pass
+        try:
+            return bool(extract_videos_from_chain(chain))
+        except Exception:
+            return False
+
+    def _should_defer_empty_heyiwei_trigger(
+        self,
+        event: AstrMessageEvent,
+        *,
+        trigger_keyword: Optional[str],
+        inline: str,
+        chain: Optional[List[object]] = None,
+    ) -> bool:
+        """空的 `hyw/何意味` 触发词不默认占用消息，让普通聊天继续处理。"""
+        if trigger_keyword not in HE_YI_WEI_TRIGGER_KEYWORDS:
+            return False
+        if inline:
+            return False
+        chain = chain if isinstance(chain, list) else self._safe_get_chain(event)
+        if self._chain_has_reply(chain):
+            return False
+        return not self._has_direct_explainable_payload(event, chain)
 
     async def _resolve_images_for_llm(
         self, event: AstrMessageEvent, images: List[str]
@@ -1553,6 +1722,19 @@ class ZssmExplain(Star):
 
     _ExplainPlan = Union[_LLMPlan, _VideoPlan, _BilibiliPlan, _ReplyPlan]
 
+    def _build_empty_input_reply_plan(
+        self, cleanup_paths: Optional[List[str]] = None
+    ) -> Optional[_ReplyPlan]:
+        if not self._get_conf_bool(
+            EMPTY_ZSSM_PROMPT_ENABLE_KEY, DEFAULT_EMPTY_ZSSM_PROMPT_ENABLE
+        ):
+            return None
+        return self._ReplyPlan(
+            message="请输入要解释的内容。",
+            stop_event=True,
+            cleanup_paths=list(cleanup_paths or []),
+        )
+
     async def _build_explain_plan(
         self,
         event: AstrMessageEvent,
@@ -1562,6 +1744,7 @@ class ZssmExplain(Star):
     ) -> Optional[_ExplainPlan]:
         """将输入解析/拼装为一个可执行的解释计划（builder 阶段）。"""
         cleanup_paths: List[str] = []
+        request_proxy = self._get_request_proxy()
 
         if inline:
             urls = extract_urls_from_text(inline) if enable_url else []
@@ -1588,6 +1771,24 @@ class ZssmExplain(Star):
                 timeout_sec = self._get_conf_int(
                     URL_FETCH_TIMEOUT_KEY, DEFAULT_URL_FETCH_TIMEOUT, 2, 60
                 )
+                if match_zhihu_url(target_url):
+                    try:
+                        zhihu_ctx = await prepare_zhihu_prompt(
+                            target_url,
+                            cookie=self._get_conf_str(ZHIHU_COOKIE_KEY, ""),
+                            timeout_sec=timeout_sec,
+                        )
+                    except ZhihuParseError as exc:
+                        return self._ReplyPlan(
+                            message=str(exc),
+                            stop_event=True,
+                            cleanup_paths=cleanup_paths,
+                        )
+                    return self._LLMPlan(
+                        user_prompt=zhihu_ctx.prompt,
+                        images=zhihu_ctx.images,
+                        cleanup_paths=cleanup_paths,
+                    )
                 max_chars = self._get_conf_int(
                     URL_MAX_CHARS_KEY,
                     DEFAULT_URL_MAX_CHARS,
@@ -1608,6 +1809,7 @@ class ZssmExplain(Star):
                     cf_screenshot_height=height,
                     file_preview_max_bytes=self._get_file_preview_max_bytes(),
                     user_prompt_template=DEFAULT_URL_USER_PROMPT,
+                    proxy=request_proxy,
                 )
                 if not url_ctx:
                     return self._ReplyPlan(
@@ -1760,15 +1962,7 @@ class ZssmExplain(Star):
                     stop_event=True,
                     cleanup_paths=cleanup_paths,
                 )
-            if self._get_conf_bool(
-                EMPTY_ZSSM_PROMPT_ENABLE_KEY, DEFAULT_EMPTY_ZSSM_PROMPT_ENABLE
-            ):
-                return self._ReplyPlan(
-                    message="请输入要解释的内容。",
-                    stop_event=True,
-                    cleanup_paths=cleanup_paths,
-                )
-            return None
+            return self._build_empty_input_reply_plan(cleanup_paths)
 
         urls = extract_urls_from_text(text) if (enable_url and text) else []
         if urls and not from_forward:
@@ -1793,6 +1987,24 @@ class ZssmExplain(Star):
             timeout_sec = self._get_conf_int(
                 URL_FETCH_TIMEOUT_KEY, DEFAULT_URL_FETCH_TIMEOUT, 2, 60
             )
+            if match_zhihu_url(target_url):
+                try:
+                    zhihu_ctx = await prepare_zhihu_prompt(
+                        target_url,
+                        cookie=self._get_conf_str(ZHIHU_COOKIE_KEY, ""),
+                        timeout_sec=timeout_sec,
+                    )
+                except ZhihuParseError as exc:
+                    return self._ReplyPlan(
+                        message=str(exc),
+                        stop_event=True,
+                        cleanup_paths=cleanup_paths,
+                    )
+                return self._LLMPlan(
+                    user_prompt=zhihu_ctx.prompt,
+                    images=zhihu_ctx.images,
+                    cleanup_paths=cleanup_paths,
+                )
             max_chars = self._get_conf_int(
                 URL_MAX_CHARS_KEY,
                 DEFAULT_URL_MAX_CHARS,
@@ -1813,6 +2025,7 @@ class ZssmExplain(Star):
                 cf_screenshot_height=height,
                 file_preview_max_bytes=self._get_file_preview_max_bytes(),
                 user_prompt_template=DEFAULT_URL_USER_PROMPT,
+                proxy=request_proxy,
             )
             if not url_ctx:
                 return self._ReplyPlan(
@@ -1833,7 +2046,12 @@ class ZssmExplain(Star):
             )
             extra_block = ""
             try:
-                html = await fetch_html(target_url, timeout_sec, self._last_fetch_info)
+                html = await fetch_html(
+                    target_url,
+                    timeout_sec,
+                    self._last_fetch_info,
+                    proxy=request_proxy,
+                )
             except Exception:
                 html = None
             if isinstance(html, str) and html.strip():
@@ -1959,11 +2177,9 @@ class ZssmExplain(Star):
             except Exception:
                 pass
 
-    @filter.command("zssm", alias={"知识说明", "解释", "hyw", "何意味"})
+    @filter.command("zssm")
     async def zssm(self, event: AstrMessageEvent):
         """解释被回复消息：/zssm 或关键词触发；若携带内容则直接解释该内容，否则按回复消息逻辑。"""
-        # 在入口处调用 event.should_call_llm(True)，阻止默认 LLM 接管
-        event.should_call_llm(True)
         cleanup_paths: List[str] = []
         try:
             try:
@@ -1971,21 +2187,59 @@ class ZssmExplain(Star):
                     return
             except Exception:
                 pass
-            if self._already_handled(event):
-                return
 
             # 触发校验：确保开启了对应开关，且在关闭关键词触发时必须带有指令前缀
             chain = self._safe_get_chain(event)
             head_text = self._first_plain_head_text(chain)
             # 如果首个文本没搜到，回退到整体字符串
             check_text = head_text or (getattr(event, "message_str", "") or "")
-            if not self._is_zssm_trigger(check_text, is_command=True):
+            trigger_keyword = self._match_trigger_keyword(check_text)
+            actual_command_like = False
+            try:
+                text_for_check = check_text.strip()
+                has_prefix = bool(re.match(r"^\s*([/!！。\.、，\-]+)", text_for_check))
+                at_me = False
+                try:
+                    self_id = event.get_self_id()
+                    at_me = self._chain_has_at_me(chain, self_id)
+                except Exception:
+                    at_me = False
+                actual_command_like = has_prefix or (
+                    at_me and trigger_keyword == COMMAND_TRIGGER_KEYWORD
+                )
+            except Exception:
+                actual_command_like = False
+
+            if not self._is_zssm_trigger(check_text, is_command=actual_command_like):
                 logger.debug(
                     f"zssm_explain: zssm command filter blocked execution. check_text: {check_text}"
                 )
                 return
 
             inline = self._get_inline_content(event)
+            if self._should_defer_empty_heyiwei_trigger(
+                event,
+                trigger_keyword=trigger_keyword,
+                inline=inline,
+                chain=chain,
+            ):
+                reply_plan = self._build_empty_input_reply_plan()
+                if reply_plan is None:
+                    logger.debug(
+                        "zssm_explain: ignore empty heyiwei trigger without reply/payload"
+                    )
+                    return
+                event.should_call_llm(True)
+                if self._already_handled(event):
+                    return
+                async for r in self._execute_explain_plan(event, reply_plan):
+                    yield r
+                return
+
+            # 真正进入解释流程前再阻止默认 LLM 接管，避免空的 hyw/何意味 误拦截普通聊天
+            event.should_call_llm(True)
+            if self._already_handled(event):
+                return
             enable_url = self._get_conf_bool(
                 URL_DETECT_ENABLE_KEY, DEFAULT_URL_DETECT_ENABLE
             )
@@ -2030,7 +2284,7 @@ class ZssmExplain(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def keyword_zssm(self, event: AstrMessageEvent):
-        """关键词触发：忽略常见前缀/Reply/At 等，检测首个 Plain 段的 zssm。
+        """关键词触发：忽略常见前缀/Reply/At 等，检测首个 Plain 段的配置关键词。
         避免与 /zssm 指令重复：若以 /zssm 开头则交由指令处理。
         """
         # 群聊权限控制：不满足条件则直接忽略
@@ -2058,9 +2312,15 @@ class ZssmExplain(Star):
             at_me = False
         if isinstance(head, str) and head.strip():
             hs = head.strip()
-            if re.match(r"^\s*/\s*(zssm|hyw|何意味)(\s|$)", hs, re.I):
+            if re.match(
+                rf"^\s*/\s*({re.escape(COMMAND_TRIGGER_KEYWORD)})(\s|$)",
+                hs,
+                re.I,
+            ):
                 return
-            if at_me and re.match(r"^(zssm|hyw|何意味)(\s|$)", hs, re.I):
+            if at_me and re.match(
+                rf"^({re.escape(COMMAND_TRIGGER_KEYWORD)})(\s|$)", hs, re.I
+            ):
                 return
             if self._is_zssm_trigger(hs, is_command=at_me):
                 async for r in self.zssm(event):
@@ -2073,9 +2333,15 @@ class ZssmExplain(Star):
             text = getattr(event, "message_str", "") or ""
         if isinstance(text, str) and text.strip():
             t = text.strip()
-            if re.match(r"^\s*/\s*(zssm|hyw|何意味)(\s|$)", t, re.I):
+            if re.match(
+                rf"^\s*/\s*({re.escape(COMMAND_TRIGGER_KEYWORD)})(\s|$)",
+                t,
+                re.I,
+            ):
                 return
-            if at_me and re.match(r"^(zssm|hyw|何意味)(\s|$)", t, re.I):
+            if at_me and re.match(
+                rf"^({re.escape(COMMAND_TRIGGER_KEYWORD)})(\s|$)", t, re.I
+            ):
                 return
             if self._is_zssm_trigger(t, is_command=at_me):
                 async for r in self.zssm(event):

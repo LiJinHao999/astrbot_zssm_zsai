@@ -21,6 +21,7 @@ from astrbot.api.event import AstrMessageEvent
 import astrbot.api.message_components as Comp
 
 from .message_utils import ob_data
+from .proxy_utils import create_async_http_client
 
 
 def _safe_subprocess_run(cmd: List[str]) -> subprocess.CompletedProcess:
@@ -847,6 +848,7 @@ async def download_video_to_temp(
     size_mb_limit: int,
     headers: Optional[Dict[str, str]] = None,
     timeout_sec: int = 120,
+    proxy: Optional[str] = None,
 ) -> Optional[str]:
     """下载视频到临时文件，做大小限制校验。
 
@@ -886,6 +888,65 @@ async def download_video_to_temp(
     tmp.close()
     max_bytes = size_mb_limit * 1024 * 1024
     dl_timeout = max(30, min(600, timeout_sec))
+    if proxy:
+        try:
+            async with create_async_http_client(
+                headers=headers or {},
+                timeout_sec=dl_timeout,
+                follow_redirects=True,
+                proxy=proxy,
+            ) as client:
+                async with client.stream("GET", url) as resp:
+                    if int(resp.status_code) != 200:
+                        logger.warning(
+                            "zssm_explain: download_video_to_temp status=%s url=%s",
+                            resp.status_code,
+                            url[:80],
+                        )
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
+                        return None
+                    cl = resp.headers.get("Content-Length")
+                    if cl and cl.isdigit() and int(cl) > max_bytes:
+                        logger.warning(
+                            "zssm_explain: download_video_to_temp size %s > limit %s",
+                            cl,
+                            max_bytes,
+                        )
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
+                        return None
+                    total = 0
+                    with open(tmp_path, "wb") as f:
+                        async for chunk in resp.aiter_bytes(8192):
+                            if not chunk:
+                                break
+                            total += len(chunk)
+                            if total > max_bytes:
+                                try:
+                                    f.close()
+                                except Exception:
+                                    pass
+                                try:
+                                    os.remove(tmp_path)
+                                except Exception:
+                                    pass
+                                return None
+                            f.write(chunk)
+            return tmp_path if os.path.exists(tmp_path) else None
+        except Exception as e:
+            logger.warning(
+                "zssm_explain: download_video_to_temp via proxy failed: %s", e
+            )
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+            return None
     if aiohttp is not None:
         try:
             timeout_obj = aiohttp.ClientTimeout(total=dl_timeout)
@@ -1087,6 +1148,7 @@ async def extract_forward_video_keyframes(
     max_sec: int,
     timeout_sec: int,
     video_meta: Optional[dict] = None,
+    proxy: Optional[str] = None,
 ) -> Tuple[List[str], List[str]]:
     """将合并转发中的视频源转换为少量关键帧图片（默认每个视频 1 张），用于"聊天记录解释"场景。
 
@@ -1171,7 +1233,11 @@ async def extract_forward_video_keyframes(
             if isinstance(resolved_src, str) and is_http_url(resolved_src):
                 try:
                     local_path = await asyncio.wait_for(
-                        download_video_to_temp(resolved_src, max_mb),
+                        download_video_to_temp(
+                            resolved_src,
+                            max_mb,
+                            proxy=proxy,
+                        ),
                         timeout=max(2, int(timeout_sec)),
                     )
                 except Exception as e:

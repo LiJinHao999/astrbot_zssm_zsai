@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import math
 import os
 import re
 import shutil
+import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -46,6 +48,7 @@ from .prompt_utils import (
 from .url_utils import (
     build_url_brief_for_forward,
     build_url_failure_message,
+    download_image_to_temp,
     extract_urls_from_text,
     fetch_html,
     prepare_url_prompt,
@@ -123,6 +126,8 @@ DEFAULT_FILE_PREVIEW_EXTS = "txt,md,log,json,csv,ini,cfg,yml,yaml,py"
 DEFAULT_FILE_PREVIEW_MAX_SIZE_KB = 100
 DEFAULT_FORWARD_VIDEO_KEYFRAME_ENABLE = True
 DEFAULT_FORWARD_VIDEO_MAX_COUNT = 2
+GEMINI_IMAGE_INPUT_MAX_COUNT = 14
+GIF_FRAME_JPEG_QUALITY = 88
 TRIGGER_KEYWORDS_KEY = "trigger_keywords"
 COMMAND_TRIGGER_KEYWORD = "zssm"
 DEFAULT_EXTRA_TRIGGER_KEYWORDS = ("hyw", "何意味")
@@ -147,6 +152,18 @@ class ZssmExplain(Star):
     async def initialize(self):
         """可选：插件初始化。"""
         self._migrate_legacy_trigger_keywords_config()
+
+    @staticmethod
+    def _cleanup_temp_paths(paths: List[str]) -> None:
+        for p in paths:
+            try:
+                if isinstance(p, str) and p:
+                    if os.path.isdir(p):
+                        shutil.rmtree(p, ignore_errors=True)
+                    elif os.path.isfile(p):
+                        os.remove(p)
+            except Exception:
+                pass
 
     def _reply_text_result(self, event: AstrMessageEvent, text: str):
         """构造一个显式“回复调用者”的文本消息结果。
@@ -557,6 +574,7 @@ class ZssmExplain(Star):
             )
             if url_ctx:
                 user_prompt, _text, images = url_ctx
+                cleanup_paths: List[str] = []
                 # 获取 provider
                 try:
                     provider = self.context.get_using_provider(
@@ -573,10 +591,15 @@ class ZssmExplain(Star):
                     )
                     return
 
-                image_urls = self._llm.filter_supported_images(images)
-                system_prompt = await self._build_system_prompt(event)
-
                 try:
+                    images, image_cleanup, gif_notes = await self._resolve_images_for_llm_prepared(
+                        event, images
+                    )
+                    cleanup_paths.extend(image_cleanup)
+                    if gif_notes:
+                        user_prompt = user_prompt + "\n" + "\n".join(gif_notes)
+                    image_urls = self._llm.filter_supported_images(images)
+                    system_prompt = await self._build_system_prompt(event)
                     start_ts = time.perf_counter()
                     call_provider = self._llm.select_primary_provider(
                         session_provider=provider, image_urls=image_urls
@@ -597,6 +620,8 @@ class ZssmExplain(Star):
                     return
                 except Exception as e:
                     logger.error("zssm_explain: bilibili screenshot LLM failed: %s", e)
+                finally:
+                    self._cleanup_temp_paths(cleanup_paths)
 
             # 根据是否配置了 Cookie 给出不同的错误提示
             if not bili_cookie:
@@ -642,11 +667,17 @@ class ZssmExplain(Star):
             )
             return
 
-        # 过滤支持的图片
-        image_urls = self._llm.filter_supported_images(images)
-        system_prompt = await self._build_system_prompt(event)
+        cleanup_paths: List[str] = []
 
         try:
+            images, image_cleanup, gif_notes = await self._resolve_images_for_llm_prepared(
+                event, images
+            )
+            cleanup_paths.extend(image_cleanup)
+            if gif_notes:
+                user_prompt = user_prompt + "\n" + "\n".join(gif_notes)
+            image_urls = self._llm.filter_supported_images(images)
+            system_prompt = await self._build_system_prompt(event)
             start_ts = time.perf_counter()
             call_provider = self._llm.select_primary_provider(
                 session_provider=provider, image_urls=image_urls
@@ -669,6 +700,8 @@ class ZssmExplain(Star):
             yield self._reply_text_result(
                 event, self._format_llm_error(e, f"解释 B 站{type_name}")
             )
+        finally:
+            self._cleanup_temp_paths(cleanup_paths)
 
     async def _explain_video(
         self,
@@ -1377,6 +1410,183 @@ class ZssmExplain(Star):
         return [x for x in images if isinstance(x, str) and x]
 
     @staticmethod
+    def _is_gif_image_ref(image_ref: str) -> bool:
+        if not isinstance(image_ref, str) or not image_ref:
+            return False
+        s = image_ref.strip()
+        ls = s.lower()
+        if ls.startswith("base64:data:image/"):
+            s = s[len("base64:") :]
+            ls = s.lower()
+        if ls.startswith("data:image/gif;base64,"):
+            return True
+        if ls.startswith("base64://"):
+            try:
+                head = base64.b64decode(s[len("base64://") :][:64], validate=False)
+                return head.startswith((b"GIF87a", b"GIF89a"))
+            except Exception:
+                return False
+        if ls.startswith("file://"):
+            s = s[7:]
+            if s.startswith("/") and len(s) > 3 and s[2] == ":":
+                s = s[1:]
+            ls = s.lower()
+        if ls.endswith(".gif"):
+            return True
+        try:
+            with open(s, "rb") as f:
+                return f.read(6) in (b"GIF87a", b"GIF89a")
+        except Exception:
+            return False
+
+    @staticmethod
+    def _sample_frame_indices(frame_count: int, max_count: int) -> List[int]:
+        if frame_count <= 0 or max_count <= 0:
+            return []
+        if frame_count <= max_count:
+            return list(range(frame_count))
+        if max_count == 1:
+            return [0]
+        step = (frame_count - 1) / float(max_count - 1)
+        indices: List[int] = []
+        seen: Set[int] = set()
+        for i in range(max_count):
+            idx = int(round(i * step))
+            idx = max(0, min(frame_count - 1, idx))
+            if idx not in seen:
+                seen.add(idx)
+                indices.append(idx)
+        return indices
+
+    @staticmethod
+    def _decode_inline_image_bytes(image_ref: str) -> Optional[bytes]:
+        if not isinstance(image_ref, str) or not image_ref:
+            return None
+        s = image_ref.strip()
+        ls = s.lower()
+        if ls.startswith("base64:data:image/"):
+            s = s[len("base64:") :]
+            ls = s.lower()
+        if ls.startswith("data:image/") and ";base64," in ls:
+            try:
+                return base64.b64decode(s.split(",", 1)[1], validate=False)
+            except Exception:
+                return None
+        if ls.startswith("base64://"):
+            try:
+                return base64.b64decode(s[len("base64://") :], validate=False)
+            except Exception:
+                return None
+        return None
+
+    async def _download_http_image_for_llm(self, image_ref: str) -> Optional[str]:
+        """预下载 http(s) 图片，避免 Provider 内部二次下载后转出不支持的 MIME。"""
+        if not isinstance(image_ref, str) or not image_ref.lower().startswith(
+            ("http://", "https://")
+        ):
+            return None
+        try:
+            return await download_image_to_temp(
+                image_ref.strip(), proxy=self._get_request_proxy()
+            )
+        except Exception as e:
+            logger.warning("zssm_explain: pre-download image failed: %s", e)
+            return None
+
+    async def _convert_gif_to_jpeg_frames(
+        self, image_ref: str, *, max_frames: int = GEMINI_IMAGE_INPUT_MAX_COUNT
+    ) -> Tuple[List[str], Optional[str]]:
+        """将 GIF 等距抽帧为 JPEG，返回 (frame_paths, cleanup_dir)。"""
+        if not self._is_gif_image_ref(image_ref):
+            return ([], None)
+
+        src_path: Optional[str] = None
+        temp_src_dir: Optional[str] = None
+        temp_src_file: Optional[str] = None
+        out_dir: Optional[str] = None
+        try:
+            data = self._decode_inline_image_bytes(image_ref)
+            if data:
+                temp_src_dir = tempfile.mkdtemp(prefix="zssm_gif_src_")
+                src_path = os.path.join(temp_src_dir, "input.gif")
+                with open(src_path, "wb") as f:
+                    f.write(data)
+            else:
+                src_path = image_ref.strip()
+                if src_path.lower().startswith("file://"):
+                    src_path = src_path[7:]
+                    if (
+                        src_path.startswith("/")
+                        and len(src_path) > 3
+                        and src_path[2] == ":"
+                    ):
+                        src_path = src_path[1:]
+                if src_path.lower().startswith(("http://", "https://")):
+                    downloaded = await self._download_http_image_for_llm(src_path)
+                    if not downloaded:
+                        return ([], None)
+                    temp_src_file = downloaded
+                    src_path = downloaded
+
+            if not src_path or not os.path.exists(src_path):
+                return ([], None)
+
+            out_dir = tempfile.mkdtemp(prefix="zssm_gif_frames_")
+
+            def _extract() -> List[str]:
+                from PIL import Image, ImageSequence
+
+                frame_paths: List[str] = []
+                with Image.open(src_path) as im:
+                    try:
+                        frame_count = int(getattr(im, "n_frames", 1) or 1)
+                    except Exception:
+                        frame_count = 1
+                    indices = set(
+                        self._sample_frame_indices(
+                            frame_count,
+                            max(1, min(max_frames, GEMINI_IMAGE_INPUT_MAX_COUNT)),
+                        )
+                    )
+                    for idx, frame in enumerate(ImageSequence.Iterator(im)):
+                        if idx not in indices:
+                            continue
+                        rgba = frame.convert("RGBA")
+                        bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+                        bg.alpha_composite(rgba)
+                        out = os.path.join(
+                            out_dir, f"gif_frame_{len(frame_paths) + 1:03d}.jpg"
+                        )
+                        bg.convert("RGB").save(
+                            out,
+                            "JPEG",
+                            quality=GIF_FRAME_JPEG_QUALITY,
+                            optimize=True,
+                        )
+                        frame_paths.append(out)
+                return frame_paths
+
+            frames = await asyncio.get_running_loop().run_in_executor(None, _extract)
+            if not frames:
+                if out_dir:
+                    shutil.rmtree(out_dir, ignore_errors=True)
+                return ([], None)
+            return (frames, out_dir)
+        except Exception as e:
+            logger.warning("zssm_explain: gif frame extraction failed: %s", e)
+            if out_dir:
+                shutil.rmtree(out_dir, ignore_errors=True)
+            return ([], None)
+        finally:
+            if temp_src_dir:
+                shutil.rmtree(temp_src_dir, ignore_errors=True)
+            if temp_src_file:
+                try:
+                    os.remove(temp_src_file)
+                except Exception:
+                    pass
+
+    @staticmethod
     def _chain_has_reply(chain: List[object]) -> bool:
         """检测当前消息链是否显式引用了其他消息。"""
         if not isinstance(chain, list):
@@ -1427,6 +1637,11 @@ class ZssmExplain(Star):
     async def _resolve_images_for_llm(
         self, event: AstrMessageEvent, images: List[str]
     ) -> List[str]:
+        return await self._resolve_image_refs_raw(event, images)
+
+    async def _resolve_image_refs_raw(
+        self, event: AstrMessageEvent, images: List[str]
+    ) -> List[str]:
         """将图片引用尽量解析成 LLM 可用的形式，并去重保持顺序。
 
         支持：
@@ -1446,6 +1661,8 @@ class ZssmExplain(Star):
             ls = s.lower()
             if ls.startswith(("http://", "https://")):
                 return s
+            if ls.startswith("base64:data:image/"):
+                return s[len("base64:") :]
             if ls.startswith("base64://") or ls.startswith("data:image/"):
                 return s
             if ls.startswith("file://"):
@@ -1466,13 +1683,13 @@ class ZssmExplain(Star):
                 return None
             return None
 
-        resolved: List[str] = []
+        resolved_raw: List[str] = []
         seen = set()
 
         def _add(cand: str) -> None:
             if cand and cand not in seen:
                 seen.add(cand)
-                resolved.append(cand)
+                resolved_raw.append(cand)
 
         resolve_candidates: List[str] = []
         for img in images:
@@ -1531,7 +1748,7 @@ class ZssmExplain(Star):
                         e,
                     )
 
-        if not resolved and images:
+        if not resolved_raw and images:
             # 打印可读的排查信息（避免把整段 base64 打到日志）
             try:
                 plat = event.get_platform_name()
@@ -1553,7 +1770,11 @@ class ZssmExplain(Star):
                 if not s:
                     continue
                 ls = s.lower()
-                if ls.startswith("base64://") or ls.startswith("data:image/"):
+                if (
+                    ls.startswith("base64://")
+                    or ls.startswith("data:image/")
+                    or ls.startswith("base64:data:image/")
+                ):
                     brief.append(f"{ls[:16]}...(len={len(s)})")
                 else:
                     brief.append(s[:120])
@@ -1565,7 +1786,50 @@ class ZssmExplain(Star):
                 brief,
             )
 
-        return resolved
+        return resolved_raw
+
+    async def _resolve_images_for_llm_prepared(
+        self, event: AstrMessageEvent, images: List[str]
+    ) -> Tuple[List[str], List[str], List[str]]:
+        """解析并预处理图片引用，返回 (可传给 Provider 的图片, 待清理路径, GIF 说明)。"""
+        resolved_raw = await self._resolve_image_refs_raw(event, images)
+        resolved: List[str] = []
+        cleanup_paths: List[str] = []
+        gif_notes: List[str] = []
+        for img in resolved_raw:
+            remaining_slots = GEMINI_IMAGE_INPUT_MAX_COUNT - len(resolved)
+            if remaining_slots <= 0:
+                break
+
+            candidate = img
+            if isinstance(img, str) and img.lower().startswith(("http://", "https://")):
+                downloaded = await self._download_http_image_for_llm(img)
+                if not downloaded:
+                    logger.warning(
+                        "zssm_explain: skip http image because pre-download failed"
+                    )
+                    continue
+                candidate = downloaded
+                cleanup_paths.append(downloaded)
+
+            if self._is_gif_image_ref(candidate):
+                frames, cleanup_dir = await self._convert_gif_to_jpeg_frames(
+                    candidate, max_frames=remaining_slots
+                )
+                if frames:
+                    resolved.extend(frames)
+                    if cleanup_dir:
+                        cleanup_paths.append(cleanup_dir)
+                    gif_notes.append(
+                        f"其中 {len(frames)} 张图片是从同一个 GIF 中按播放顺序等距抽取的 JPEG 帧。"
+                    )
+                    continue
+                logger.warning("zssm_explain: skip unsupported gif image for LLM")
+                continue
+
+            resolved.append(candidate)
+
+        return (resolved, cleanup_paths, gif_notes)
 
     # ===== URL 相关：检测、抓取、提取与组装提示词 =====
     def _get_conf_bool(self, key: str, default: bool) -> bool:
@@ -1825,11 +2089,16 @@ class ZssmExplain(Star):
                 )
 
             inline_images_raw = self._extract_images_from_event(event)
-            inline_images = (
-                await self._resolve_images_for_llm(event, inline_images_raw)
-                if inline_images_raw
-                else []
-            )
+            inline_gif_notes: List[str] = []
+            if inline_images_raw:
+                inline_images, image_cleanup, inline_gif_notes = (
+                    await self._resolve_images_for_llm_prepared(
+                        event, inline_images_raw
+                    )
+                )
+                cleanup_paths.extend(image_cleanup)
+            else:
+                inline_images = []
             if inline_images_raw and not inline_images:
                 # 部分平台会把图片段转成占位文本（如 "[图片]"），此时如果图片解析失败就不要继续调用 LLM。
                 placeholder = str(inline or "").strip().lower()
@@ -1839,6 +2108,8 @@ class ZssmExplain(Star):
                         cleanup_paths=cleanup_paths,
                     )
             user_prompt = build_user_prompt(inline, inline_images)
+            if inline_gif_notes:
+                user_prompt = user_prompt + "\n" + "\n".join(inline_gif_notes)
             return self._LLMPlan(
                 user_prompt=user_prompt,
                 images=inline_images,
@@ -1948,9 +2219,13 @@ class ZssmExplain(Star):
 
         raw_images = list(images) if isinstance(images, list) else []
         try:
-            images = await self._resolve_images_for_llm(event, images)
+            images, image_cleanup, gif_notes = await self._resolve_images_for_llm_prepared(
+                event, images
+            )
+            cleanup_paths.extend(image_cleanup)
         except Exception:
             images = []
+            gif_notes = []
         # Deduplicate resolved images
         if isinstance(images, list):
             images = list(dict.fromkeys(images))
@@ -2071,11 +2346,15 @@ class ZssmExplain(Star):
                     f"{snippet}"
                 )
             user_prompt = base_prompt + extra_block
+            if gif_notes:
+                user_prompt = user_prompt + "\n" + "\n".join(gif_notes)
             return self._LLMPlan(
                 user_prompt=user_prompt, images=images, cleanup_paths=cleanup_paths
             )
 
         user_prompt = build_user_prompt(text, images)
+        if gif_notes:
+            user_prompt = user_prompt + "\n" + "\n".join(gif_notes)
         return self._LLMPlan(
             user_prompt=user_prompt, images=images, cleanup_paths=cleanup_paths
         )
@@ -2106,6 +2385,7 @@ class ZssmExplain(Star):
 
         user_prompt = plan.user_prompt
         images = plan.images
+        cleanup_paths: List[str] = []
 
         try:
             provider = self.context.get_using_provider(umo=event.unified_msg_origin)
@@ -2120,9 +2400,15 @@ class ZssmExplain(Star):
             return
 
         system_prompt = await self._build_system_prompt(event)
-        image_urls = self._llm.filter_supported_images(images)
 
         try:
+            images, image_cleanup, gif_notes = await self._resolve_images_for_llm_prepared(
+                event, images
+            )
+            cleanup_paths.extend(image_cleanup)
+            if gif_notes:
+                user_prompt = user_prompt + "\n" + "\n".join(gif_notes)
+            image_urls = self._llm.filter_supported_images(images)
             start_ts = time.perf_counter()
             call_provider = self._llm.select_primary_provider(
                 session_provider=provider, image_urls=image_urls
@@ -2176,6 +2462,8 @@ class ZssmExplain(Star):
                 event.stop_event()
             except Exception:
                 pass
+        finally:
+            self._cleanup_temp_paths(cleanup_paths)
 
     @filter.command("zssm")
     async def zssm(self, event: AstrMessageEvent):
@@ -2266,18 +2554,7 @@ class ZssmExplain(Star):
             except Exception:
                 pass
         finally:
-            try:
-                for p in cleanup_paths:
-                    try:
-                        if isinstance(p, str) and p:
-                            if os.path.isdir(p):
-                                shutil.rmtree(p, ignore_errors=True)
-                            elif os.path.isfile(p):
-                                os.remove(p)
-                    except Exception:
-                        continue
-            except Exception:
-                pass
+            self._cleanup_temp_paths(cleanup_paths)
 
     async def terminate(self):
         return

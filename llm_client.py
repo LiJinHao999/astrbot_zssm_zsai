@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import mimetypes
 import os
 import re
 from typing import Any, Callable, List, Optional
+from urllib.parse import urlparse
 
 
 LLM_TIMEOUT_SEC_KEY = "llm_timeout_sec"
@@ -39,34 +41,81 @@ class LLMClient:
         """只保留看起来可被 LLM 读取的图片引用：
 
         - http(s) 链接
-        - base64://... 或 data:image/...;base64,...
+        - base64://... 或 data:image/...;base64,...（排除 Gemini 不支持的 GIF）
         - file://...（转换为本地路径）
         - 本地路径（绝对/相对，存在则通过）
         """
         ok: List[str] = []
+
+        def _existing_non_gif_path(path: str) -> Optional[str]:
+            if not os.path.exists(path):
+                return None
+            abs_path = os.path.abspath(path)
+            try:
+                with open(abs_path, "rb") as f:
+                    if f.read(6) in (b"GIF87a", b"GIF89a"):
+                        return None
+            except Exception:
+                pass
+            return abs_path
+
         for x in images:
             try:
                 if isinstance(x, str) and x:
-                    lx = x.lower()
+                    s = x.strip()
+                    if not s:
+                        continue
+                    lx = s.lower()
+                    compact_head = "".join(s[:160].split()).lower()
+                    if "data:image/gif" in compact_head:
+                        continue
+                    if compact_head.startswith("base64:data:image/"):
+                        normalized = s[len("base64:") :].strip()
+                        if normalized.lower().startswith("data:image/gif;"):
+                            continue
+                        ok.append(normalized)
+                        continue
+                    if lx.startswith("data:image/gif;"):
+                        continue
+                    try:
+                        path_for_ext = (
+                            urlparse(s).path
+                            if lx.startswith(("http://", "https://"))
+                            else s
+                        )
+                        if path_for_ext.lower().endswith(".gif"):
+                            continue
+                    except Exception:
+                        pass
+                    if lx.startswith("base64://"):
+                        try:
+                            head = base64.b64decode(s[len("base64://") :][:64])
+                            if head.startswith((b"GIF87a", b"GIF89a")):
+                                continue
+                        except (binascii.Error, ValueError):
+                            pass
                     if lx.startswith(("http://", "https://")):
-                        ok.append(x)
+                        ok.append(s)
                     # OneBot 常见：base64://... 或 data:image/...;base64,...
                     elif lx.startswith("base64://") or lx.startswith("data:image/"):
-                        ok.append(x)
+                        ok.append(s)
                     # OneBot 常见：file://...
                     elif lx.startswith("file://"):
                         try:
-                            fp = x[7:]
+                            fp = s[7:]
                             # Windows: file:///C:/xxx
                             if fp.startswith("/") and len(fp) > 3 and fp[2] == ":":
                                 fp = fp[1:]
-                            if fp and os.path.exists(fp):
-                                ok.append(os.path.abspath(fp))
+                            resolved = _existing_non_gif_path(fp) if fp else None
+                            if resolved:
+                                ok.append(resolved)
                         except Exception:
                             pass
                     # 本地路径：绝对/相对都接受（存在则通过）
-                    elif os.path.exists(x):
-                        ok.append(os.path.abspath(x))
+                    else:
+                        resolved = _existing_non_gif_path(s)
+                        if resolved:
+                            ok.append(resolved)
             except Exception:
                 pass
         return ok
@@ -194,6 +243,7 @@ class LLMClient:
         - 先 primary，再 session_provider（若不同），然后遍历全部 Provider。
         - 图片场景仅尝试具备图片能力的 Provider；文本场景尝试所有 Provider。
         """
+        image_urls = self.filter_supported_images(image_urls or [])
         tried = set()
         images_present = bool(image_urls)
         timeout_sec = self._get_conf_int(

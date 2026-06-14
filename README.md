@@ -1,13 +1,10 @@
 <div align="center">
 
-![:name](https://count.getloli.com/@:astrbot_zssm_explain?name=%3Aastrbot_zssm_explain&theme=miku&padding=7&offset=0&align=top&scale=1&pixelated=1&darkmode=auto)
+## zssm_zsai 插件说明
 
-## zssm_explain 插件说明
-
-一个为 AstrBot 提供「知识说明 / 消息解释」能力的插件。支持文本、图片、网页、视频以及 QQ 群文件（含 PDF，支持转 Markdown），可智能理解被回复的消息或内容链接，并输出结构化的中文解释。
+一个面向 AstrBot 的 AI 内容取证总结插件。本仓库fork自astrbot插件[zzsm_explain](https://github.com/exynos967/astrbot_zssm_explain),非常感谢其作者对于不同文件以及链接提取和识别的兼容性支撑,精妙且优秀,非常推荐大家去使用
 
 ---
-
 </div>
 
 ## 功能概览
@@ -136,10 +133,4 @@
 ---
 
 ## 特别感谢
-
-- [Reina](https://github.com/Ri-Nai) 本插件参考了他的json消息处理代码并完善了json卡片消息的处理
-- [氕氙](https://github.com/piexian) 感谢稀有气体同学的PR
-- [プリン](https://github.com/zouyonghe) 感谢热心群u的PR
-- [回归天空](https://github.com/SXP-Simon) 感谢回归天空同学的PR
-- [xunxiing](https://github.com/xunxiing) 感谢到此为止吧同学的PR
-- [晴空](https://github.com/XXXxx7258) 感谢晴空的PR
+- [zssm_explain](https://github.com/exynos967/astrbot_zssm_explain) 插件及其作者们

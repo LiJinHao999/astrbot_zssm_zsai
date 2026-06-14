@@ -2,7 +2,9 @@
 
 ## zssm_zsai 插件说明
 
-一个面向 AstrBot 的 AI 内容取证总结插件。本仓库fork自astrbot插件[zzsm_explain](https://github.com/exynos967/astrbot_zssm_explain),非常感谢其作者对于不同文件以及链接提取和识别的兼容性支撑,精妙且优秀,非常推荐大家去使用
+一个面向 AstrBot 的多平台聚合 AI 内容取证总结插件。本仓库fork自astrbot插件[zzsm_explain](https://github.com/exynos967/astrbot_zssm_explain)
+
+非常感谢其作者对于不同文件以及链接提取和识别的兼容性支撑,精妙且优秀,非常推荐大家去使用
 
 ---
 </div>
